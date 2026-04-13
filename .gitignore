@@ -1,0 +1,22 @@
+# Virtual Environment
+mirra_env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Output Logs
+mirra_logs.jsonl
+
+# Models (Large Files)
+models/*.caffemodel
+models/*.prototxt
+
+# IDEs
+.vscode/
+.idea/
+
+# Local Dev
+.ipynb_checkpoints/
