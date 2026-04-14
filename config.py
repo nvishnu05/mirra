@@ -12,6 +12,7 @@ GENDER_PROTO = os.path.join(MODELS_DIR, "gender_deploy.prototxt")
 GENDER_MODEL = os.path.join(MODELS_DIR, "gender_net.caffemodel")
 
 # Output Settings
+DEBUG_MODE = False # Set to True to see diagnostic metrics in logs
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "mirra_logs.jsonl")
 
@@ -24,11 +25,17 @@ SMOOTHING_WINDOW_SIZE = 10  # Balanced for dynamic switching
 
 # Clothing Logic Thresholds (Recalibrated)
 CORNER_QUALITY = 0.05
-CORNER_COUNT_THRESHOLD = 6 
+CORNER_COUNT_THRESHOLD = 10    # Increased for strict formal
 EDGE_STRENGTH_THRESHOLD = 18
-PLACKET_THRESHOLD = 0.15 
-SYMMETRY_THRESHOLD = 0.50 # Higher bar for Traditional drapes
-TEXTURE_COMPLEXITY_THRESHOLD = 0.15
+PLACKET_THRESHOLD = 0.25       # Increased for strict formal
+SYMMETRY_THRESHOLD = 0.50 
+TEXTURE_COMPLEXITY_THRESHOLD = 0.10 
+MIN_TRADITIONAL_DENSITY = 0.015 
+MAX_FORMAL_STRUCTURE = 0.05    
+MAX_FORMAL_TEXTURE = 0.15      # Limit formal to low-texture garments
+TRADITIONAL_BASE_CONFIDENCE = 0.70 
+STABILITY_MARGIN = 0.8         # Lower bar for the currently active style
+DOMINANCE_FACTOR = 1.2         # Structural signal must be 20% stronger than texture for formal
 
 # Selection Weights
 CENTER_WEIGHT = 0.6

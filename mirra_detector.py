@@ -14,11 +14,15 @@ class WeightedResultsBuffer:
         self.buffer = [] # Stores tuples (value, confidence)
 
     def add(self, value, confidence):
-        if value == "unclear" or confidence < 0.1:
+        if confidence < 0.1:
             return
         self.buffer.append((value, confidence))
         if len(self.buffer) > self.size:
             self.buffer.pop(0)
+
+    def clear(self):
+        """Reset the buffer history."""
+        self.buffer = []
 
     def get_stable_value(self, current_value):
         if not self.buffer:
@@ -56,8 +60,10 @@ class MirraModule:
         self.clothing_buffer = WeightedResultsBuffer()
 
         self.last_detection_time = 0
+        self.last_seen_time = time.time() # Track for buffer resetting
+        self.last_clothing_style = "unclear" # For hysteresis
 
-    def get_clothing_style(self, torso_roi):
+    def get_clothing_style(self, torso_roi, last_style="unclear"):
         """
         Structural clothing analysis using provided torso region.
         Applies a strict 0.60 confidence gate.
@@ -81,15 +87,34 @@ class MirraModule:
         edges = cv2.Canny(gray, 50, 150)
         edge_density = np.sum(edges > 0) / edges.size
 
+        # Hysteresis Thresholds (Lowered bar for currently active style)
+        p_threshold = config.PLACKET_THRESHOLD
+        t_complexity = config.TEXTURE_COMPLEXITY_THRESHOLD
+        
+        if last_style == "formal":
+            p_threshold *= config.STABILITY_MARGIN
+        elif last_style == "traditional":
+            t_complexity *= config.STABILITY_MARGIN
+
         # Classification Heuristics
-        # Formal: Structural Placket + Corners (Increased Sensitivity: 0.7x threshold)
-        if placket_score > (config.PLACKET_THRESHOLD * 0.7) and corner_count >= config.CORNER_COUNT_THRESHOLD:
+        is_traditional = False
+        
+        # Formal: Structural Placket + Corners (Strict: High structure, Low texture + Dominance)
+        if (placket_score > p_threshold and 
+            corner_count >= config.CORNER_COUNT_THRESHOLD and 
+            edge_density < config.MAX_FORMAL_TEXTURE and
+            placket_score > (edge_density * config.DOMINANCE_FACTOR)):
             value = "formal"
             confidence = 0.85
-        # Traditional: High texture patterns
-        elif edge_density > config.TEXTURE_COMPLEXITY_THRESHOLD * 1.5:
-            value = "traditional"
-            confidence = 0.78
+        
+        # Traditional High Texture (Sarees/Silk patterns) 
+        elif edge_density > t_complexity * 1.5:
+            is_traditional = True
+        
+        # Traditional Low Structure (Kurtas/Simple ethnic)
+        elif placket_score < config.MAX_FORMAL_STRUCTURE and edge_density > config.MIN_TRADITIONAL_DENSITY:
+            is_traditional = True
+        
         # Western: Lowered priority fallback (User Spec: 0.02)
         elif edge_density > 0.02:
             value = "western"
@@ -98,18 +123,32 @@ class MirraModule:
             value = "unclear"
             confidence = 0.40
 
-        # STRICT CONFIDENCE GATE (User Spec: 0.60)
-        if confidence < 0.60:
+        if is_traditional:
+            value = "traditional"
+            # PROPORTIONAL CONFIDENCE: Scaled based on edge density
+            # Density 0.015 -> ~0.70 confidence, Density 0.20 -> ~0.90 confidence
+            confidence = min(0.95, config.TRADITIONAL_BASE_CONFIDENCE + (edge_density * 1.2))
+
+        # Reduced confidence gate (Let the buffer handle smoothing)
+        if confidence < 0.40:
             return "unclear", confidence
 
-        return value, confidence
+        return value, confidence, (edge_density, placket_score)
 
     def process_frame(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_detection.process(frame_rgb)
         
         if not results.detections:
+            # If no person seen for > 5s, clear buffers to avoid ghosting attributes
+            if time.time() - self.last_seen_time > 5.0:
+                self.age_buffer.clear()
+                self.gender_buffer.clear()
+                self.clothing_buffer.clear()
+                self.last_clothing_style = "unclear"
             return {"timestamp": time.time(), "person_detected": False}
+
+        self.last_seen_time = time.time() # Update timer as person is present
 
         frame_h, frame_w = frame.shape[:2]
         detection = results.detections[0] # Focus on primary detection
@@ -126,9 +165,9 @@ class MirraModule:
         tx1 = max(0, fx - fw)
         tx2 = min(frame_w, fx + 2*fw)
         
-        # Start at 0.5 face height (includes neck/collar)
-        ty1 = fy + int(fh * 0.5)
-        ty2 = fy + int(fh * 4.5) 
+        # Start strictly below chin (fy + 1.1*fh) to avoid mouth interference
+        ty1 = fy + int(fh * 1.1)
+        ty2 = fy + int(fh * 6.0) # Extended downward to capture lower garments/patterns
         
         # Boundary Clamping
         tx1, ty1 = max(0, tx1), max(0, ty1)
@@ -136,6 +175,7 @@ class MirraModule:
         
         clothing_val = "unclear"
         clothing_conf = 0.0
+        e_density, p_score = 0.0, 0.0
         
         # VALIDATION
         if (ty2 - ty1) > fh * 0.5:
@@ -144,7 +184,8 @@ class MirraModule:
                 # NORMALIZE (User Spec: 224x224)
                 torso_roi = cv2.resize(torso_roi, (224, 224))
                 cv2.imshow("Mirra - Clothing Debug ROI", torso_roi)
-                clothing_val, clothing_conf = self.get_clothing_style(torso_roi)
+                clothing_val, clothing_conf, metrics = self.get_clothing_style(torso_roi, self.last_clothing_style)
+                e_density, p_score = metrics
         else:
             clothing_val = "unclear"
 
@@ -175,16 +216,25 @@ class MirraModule:
             stable_age = self.age_buffer.get_stable_value(age_val)
             stable_gender = self.gender_buffer.get_stable_value(gender_raw)
             stable_clothing = self.clothing_buffer.get_stable_value(clothing_val)
+            self.last_clothing_style = stable_clothing # Update state for next frame's hysteresis
 
-            return {
+            result = {
                 "timestamp": time.time(),
                 "person_detected": True,
                 "gender": {"value": stable_gender, "confidence": round(gender_conf, 2)},
                 "age_group": {"value": stable_age, "confidence": round(age_conf, 2)},
                 "clothing_style": {"value": stable_clothing, "confidence": round(clothing_conf, 2)},
-                "people_in_frame": len(results.detections),
-                "debug": "visual_roi_preview_active"
+                "people_in_frame": len(results.detections)
             }
+            
+            if config.DEBUG_MODE:
+                result["debug"] = {
+                    "edge_density": round(e_density, 3),
+                    "placket_score": round(p_score, 3),
+                    "status": "visual_roi_preview_active"
+                }
+
+            return result
         
         return {"timestamp": time.time(), "person_detected": False}
 
