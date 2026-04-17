@@ -5,6 +5,7 @@ import json
 import os
 import config
 import mediapipe as mp
+from ultralytics import YOLO
 from collections import Counter
 from deepface import DeepFace
 
@@ -40,17 +41,26 @@ class WeightedResultsBuffer:
 class MirraModule:
     def __init__(self):
         print("[INFO] Initializing Mirra (Spec-Fix Version)...")
-        # MediaPipe Face Detection
-        self.mp_face_detection = mp.solutions.face_detection
-        self.face_detection = self.mp_face_detection.FaceDetection(
-            model_selection=0, 
-            min_detection_confidence=config.MIN_DETECTION_CONFIDENCE
-        )
+        # YOLOv8 Face Detection (replacing MediaPipe FaceDetection)
+        # Weights: yolov8n.pt (Downloaded to models/)
+        try:
+            self.face_detector = YOLO(config.YOLO_MODEL_PATH)
+            print(f"[INFO] YOLOv8 initialized from {config.YOLO_MODEL_PATH}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load YOLOv8: {e}. Falling back to basic detection.")
+            self.face_detector = None
 
-        # Age/Gender Models
-        self.age_net = cv2.dnn.readNet(config.AGE_MODEL, config.AGE_PROTO)
-        self.gender_net = cv2.dnn.readNet(config.GENDER_MODEL, config.GENDER_PROTO)
-        self.MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+        # MediaPipe Face Mesh
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
 
         # Image Enhancers
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -62,81 +72,74 @@ class MirraModule:
 
         self.last_detection_time = 0
         self.last_seen_time = time.time() # Track for buffer resetting
+        self.latest_result = None # Stores last Gender, Age, Emotion
 
 
-    def process_frame(self, frame):
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_detection.process(frame_rgb)
-        
-        if not results.detections:
-            # If no person seen for > 5s, clear buffers to avoid ghosting attributes
-            if time.time() - self.last_seen_time > 5.0:
+    def process_frame(self, frame, detection_results=None, mesh_results=None):
+        """Unified analysis with Double-Validation (YOLO + FaceMesh)."""
+        # 1. Validation check: Must have YOLO body AND FaceMesh landmarks
+        if not detection_results or not mesh_results or not mesh_results.multi_face_landmarks:
+            if time.time() - self.last_seen_time > 3.0:
                 self.age_buffer.clear()
                 self.gender_buffer.clear()
                 self.emotion_buffer.clear()
             return {"timestamp": time.time(), "person_detected": False}
 
-        self.last_seen_time = time.time() # Update timer as person is present
-
+        self.last_seen_time = time.time()
         frame_h, frame_w = frame.shape[:2]
-        detection = results.detections[0] # Focus on primary detection
-        bbox = detection.location_data.relative_bounding_box
         
-        # 1. FACE ROI (for Gender/Age) - Increased padding to 30% for expression features
-        fx, fy, fw, fh = int(bbox.xmin * frame_w), int(bbox.ymin * frame_h), int(bbox.width * frame_w), int(bbox.height * frame_h)
-        fx1, fy1 = max(0, fx - int(fw * 0.3)), max(0, fy - int(fh * 0.3))
-        fx2, fy2 = min(frame_w, fx + fw + int(fw * 0.3)), min(frame_h, fy + fh + int(fh * 0.3))
+        # 2. Get high-precision crop from FaceMesh
+        # Using specific landmark indices for top, bottom, left, right
+        face_landmarks = mesh_results.multi_face_landmarks[0]
+        pts = face_landmarks.landmark
+        # Indices: 10 (top), 152 (bottom), 234 (left), 454 (right)
+        x_min = min([p.x for p in pts]) * frame_w
+        x_max = max([p.x for p in pts]) * frame_w
+        y_min = min([p.y for p in pts]) * frame_h
+        y_max = max([p.y for p in pts]) * frame_h
+        
+        # Add slight padding for expression context (15%)
+        fw, fh = x_max - x_min, y_max - y_min
+        fx1, fy1 = max(0, int(x_min - fw * 0.15)), max(0, int(y_min - fh * 0.15))
+        fx2, fy2 = min(frame_w, int(x_max + fw * 0.15)), min(frame_h, int(y_max + fh * 0.15))
         face_roi = frame[fy1:fy2, fx1:fx2]
 
-
-        # Demographics Processing
+        # 3. Demographics & Emotion Processing (Optimized & Silent)
         if face_roi.size > 0:
-            blob = cv2.dnn.blobFromImage(face_roi, 1.0, (227, 227), self.MODEL_MEAN_VALUES, swapRB=False)
-            
-            # Gender
-            self.gender_net.setInput(blob)
-            gender_preds = self.gender_net.forward()
-            g_idx = gender_preds[0].argmax()
-            gender_raw = config.GENDER_LIST[g_idx]
-            gender_conf = float(gender_preds[0][g_idx])
-            
-            # Age
-            self.age_net.setInput(blob)
-            age_preds = self.age_net.forward()
-            a_idx = age_preds[0].argmax()
-            age_raw = config.AGE_LIST[a_idx]
-            age_val = config.AGE_MAP.get(age_raw, "unclear")
-            age_conf = float(age_preds[0][a_idx])
-            
-            # Emotion (using DeepFace)
             try:
-                # Use standard DeepFace analysis on face ROI
-                emotion_results = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False)
-                if emotion_results:
-                    res = emotion_results[0]
-                    emotion_raw = res['dominant_emotion']
-                    emotion_val = config.EMOTION_MAP.get(emotion_raw, emotion_raw)
-                    emotion_conf = float(res['emotion'][emotion_raw]) / 100.0 # DeepFace returns 0-100
-                    
-                    # Extract full proportions
-                    emotion_proportions = {
-                        config.EMOTION_MAP.get(k, k): round(float(v) / 100.0, 4) 
-                        for k, v in res['emotion'].items()
-                    }
+                objs = DeepFace.analyze(
+                    face_roi, 
+                    actions=['age', 'gender', 'emotion'], 
+                    enforce_detection=False,
+                    detector_backend='skip', # We already have a verified face crop
+                    align=True,
+                    silent=config.SILENT_MODE
+                )
+                
+                if objs:
+                    res = objs[0]
+                    # Map results
+                    gender_val = config.GENDER_MAP.get(res['dominant_gender'], "unknown")
+                    gender_conf = float(res['gender'][res['dominant_gender']]) / 100.0
+                    age_numeric = int(res['age'])
+                    age_val = self.get_age_category(age_numeric)
+                    age_conf = 1.0 # DeepFace point estimate
+                    emotion_val = config.EMOTION_MAP.get(res['dominant_emotion'], res['dominant_emotion'])
+                    emotion_conf = float(res['emotion'][res['dominant_emotion']]) / 100.0
+                    emotion_proportions = {config.EMOTION_MAP.get(k, k): round(float(v)/100.0, 4) for k, v in res['emotion'].items()}
                 else:
-                    emotion_val, emotion_conf, emotion_proportions = "neutral", 0.0, {}
+                    return {"timestamp": time.time(), "person_detected": False}
             except Exception as e:
-                print(f"[DEBUG] Emotion error: {e}")
-                emotion_val, emotion_conf, emotion_proportions = "neutral", 0.0, {}
+                print(f"[DEBUG] AI Error: {e}")
+                return {"timestamp": time.time(), "person_detected": False}
             
-            # Buffer updates
-            self.age_buffer.add(age_val, age_conf)
-            self.gender_buffer.add(gender_raw, gender_conf)
-            # Note: We buffer only the dominant emotion for stability
+            # Buffer updates for stability
+            self.age_buffer.add(age_val, 1.0)
+            self.gender_buffer.add(gender_val, gender_conf)
             self.emotion_buffer.add(emotion_val, emotion_conf)
             
             stable_age = self.age_buffer.get_stable_value(age_val)
-            stable_gender = self.gender_buffer.get_stable_value(gender_raw)
+            stable_gender = self.gender_buffer.get_stable_value(gender_val)
             stable_emotion = self.emotion_buffer.get_stable_value(emotion_val)
 
             result = {
@@ -149,17 +152,90 @@ class MirraModule:
                     "confidence": round(emotion_conf, 2),
                     "proportions": emotion_proportions
                 },
-                "people_in_frame": len(results.detections)
+                "people_in_frame": len(detection_results)
             }
             
-            if config.DEBUG_MODE:
-                result["debug"] = {
-                    "status": "visual_roi_preview_active"
-                }
-
+            self.latest_result = result
             return result
         
         return {"timestamp": time.time(), "person_detected": False}
+
+    def get_age_category(self, age):
+        """Maps numeric age to PRD categories."""
+        for category, (min_age, max_age) in config.AGE_GROUPS.items():
+            if min_age <= age <= max_age:
+                return category
+        return "unknown"
+
+    def visualize_frame(self, frame, detection_results=None):
+        """Draws FaceMesh and YOLO Bounding Box on every frame."""
+        h, w, _ = frame.shape
+        
+        # 1. YOLO Bounding Box Tracking & Attributes
+        if config.VISUALIZE_BOUNDING_BOX and detection_results is not None:
+            for det in detection_results:
+                x1, y1, x2, y2 = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+                
+                # Determine color based on emotion (if available)
+                box_color = (0, 255, 0) 
+                attr_text = []
+                
+                if self.latest_result and self.latest_result["person_detected"]:
+                    res = self.latest_result
+                    gender = res["gender"]["value"]
+                    age = res["age_group"]["value"]
+                    emotion = res["emotion"]["value"]
+                    
+                    attr_text = [f"{gender.upper()}", f"AGE: {age.upper()}", f"EMO: {emotion.upper()}"]
+                    
+                    emo_colors = {
+                        "happy": (0, 255, 255), "sad": (255, 0, 0), "angry": (0, 0, 255),
+                        "fear": (255, 0, 255), "surprised": (0, 165, 255), "neutral": (0, 255, 0)
+                    }
+                    box_color = emo_colors.get(emotion, (0, 255, 0))
+
+                # Draw YOLO Box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                
+                for i, text in enumerate(attr_text):
+                    cv2.putText(frame, text, (x1, y1 - 10 - (i * 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+                
+                if not attr_text:
+                    cv2.putText(frame, "TRACKING (YOLO)", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # 2. Face Mesh Visualization
+        if config.VISUALIZE_FACE_MESH:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mesh_results = self.face_mesh.process(frame_rgb)
+            if mesh_results.multi_face_landmarks:
+                for face_landmarks in mesh_results.multi_face_landmarks:
+                    # A. Draw General Tesselation
+                    self.mp_drawing.draw_landmarks(
+                        image=frame, landmark_list=face_landmarks,
+                        connections=self.mp_face_mesh.FACEMESH_TESSELATION,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(200, 200, 200), thickness=1, circle_radius=1)
+                    )
+                    # B. Highlight Expression Contours
+                    self.mp_drawing.draw_landmarks(
+                        image=frame, landmark_list=face_landmarks,
+                        connections=self.mp_face_mesh.FACEMESH_CONTOURS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=1)
+                    )
+                    # C. Lips & Eyes
+                    self.mp_drawing.draw_landmarks(
+                        image=frame, landmark_list=face_landmarks,
+                        connections=self.mp_face_mesh.FACEMESH_LIPS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                    )
+                    self.mp_drawing.draw_landmarks(
+                        image=frame, landmark_list=face_landmarks,
+                        connections=self.mp_face_mesh.FACEMESH_IRISES,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=self.mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2)
+                    )
 
     def log_output(self, data):
         print(json.dumps(data, indent=2))
@@ -180,8 +256,31 @@ class MirraModule:
                 if not ret: break
 
                 current_time = time.time()
+                
+                # Perform YOLOv8 Face Detection (30fps)
+                detection_results = []
+                if self.face_detector:
+                    yolo_results = self.face_detector(frame, verbose=False, conf=config.CONFIDENCE_THRESHOLD)
+                    for r in yolo_results:
+                        if r.boxes:
+                            # Extract [x1, y1, x2, y2, conf, cls]
+                            all_detections = r.boxes.data.tolist()
+                            if all_detections:
+                                # Fix "Multiple People" issue: Sort by box area and pick the largest one
+                                # Box area = (x2-x1) * (y2-y1)
+                                all_detections.sort(key=lambda x: (x[2]-x[0]) * (x[3]-x[1]), reverse=True)
+                                detection_results = [all_detections[0]] # Only focus on the primary user
+
+                # Update smooth visualization every frame (30fps) using YOLO boxes
+                self.visualize_frame(frame, detection_results)
+                
+                # Capture mesh results for validation
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mesh_results = self.face_mesh.process(frame_rgb)
+
+                # Heavy AI Analysis every 2 seconds (ONLY if YOLO + Mesh agree)
                 if current_time - self.last_detection_time >= config.DETECTION_INTERVAL:
-                    result = self.process_frame(frame)
+                    result = self.process_frame(frame, detection_results, mesh_results)
                     self.log_output(result)
                     self.last_detection_time = current_time
 
