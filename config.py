@@ -12,7 +12,7 @@ GENDER_PROTO = os.path.join(MODELS_DIR, "gender_deploy.prototxt")
 GENDER_MODEL = os.path.join(MODELS_DIR, "gender_net.caffemodel")
 
 # Output Settings
-DEBUG_MODE = False # Set to True to see diagnostic metrics in logs
+DEBUG_MODE = True # Set to True to see diagnostic metrics in logs
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "mirra_logs.jsonl")
 
@@ -22,20 +22,7 @@ CONFIDENCE_THRESHOLD = 0.50
 HIGH_CONFIDENCE_THRESHOLD = 0.85
 MIN_DETECTION_CONFIDENCE = 0.5
 SMOOTHING_WINDOW_SIZE = 10  # Balanced for dynamic switching
-
-# Clothing Logic Thresholds (Recalibrated)
-CORNER_QUALITY = 0.05
-CORNER_COUNT_THRESHOLD = 10    # Increased for strict formal
-EDGE_STRENGTH_THRESHOLD = 18
-PLACKET_THRESHOLD = 0.25       # Increased for strict formal
-SYMMETRY_THRESHOLD = 0.50 
-TEXTURE_COMPLEXITY_THRESHOLD = 0.10 
-MIN_TRADITIONAL_DENSITY = 0.015 
-MAX_FORMAL_STRUCTURE = 0.05    
-MAX_FORMAL_TEXTURE = 0.15      # Limit formal to low-texture garments
-TRADITIONAL_BASE_CONFIDENCE = 0.70 
-STABILITY_MARGIN = 0.8         # Lower bar for the currently active style
-DOMINANCE_FACTOR = 1.2         # Structural signal must be 20% stronger than texture for formal
+EMOTION_SMOOTHING_WINDOW = 3 # More responsive for fleeting expressions
 
 # Selection Weights
 CENTER_WEIGHT = 0.6
@@ -56,3 +43,15 @@ AGE_MAP = {
 }
 
 GENDER_LIST = ['male', 'female']
+
+# DeepFace Emotion Settings
+EMOTION_ACTIONS = ['emotion']
+EMOTION_MAP = {
+    'happy': 'happy',
+    'sad': 'sad',
+    'neutral': 'neutral',
+    'surprise': 'surprised',
+    'angry': 'angry',
+    'disgust': 'disgust',
+    'fear': 'fear'
+}

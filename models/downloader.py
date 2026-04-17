@@ -21,8 +21,9 @@ MODELS = {
     "gender_model": {
         "url": "https://github.com/smahesh29/Gender-and-Age-Detection/raw/master/gender_net.caffemodel",
         "filename": "gender_net.caffemodel"
-    }
+    },
 }
+
 
 def download_models(target_dir="models"):
     if not os.path.exists(target_dir):
